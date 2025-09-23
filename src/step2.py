@@ -23,6 +23,7 @@ from sklearn.metrics import (
     confusion_matrix,
     RocCurveDisplay,
     PrecisionRecallDisplay,
+    precision_recall_curve,
 )
 import matplotlib.pyplot as plt
 from scipy.stats import randint, uniform
@@ -191,21 +192,22 @@ def _split_and_cast_feature_types(
 
 # %% Core function
 
-def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
+def train_xgboost_model(data_path: str, *, cost_fp: float = 1.0, cost_fn: float = 5.0, min_recall: float | None = None) -> Tuple[XGBClassifier, Dict[str, Any]]:
     """Train an XGBoost classifier for default prediction and return model and metrics.
 
     Steps:
       - Load dataset (expects a 'target' column)
       - Clean and prepare features (OHE for categoricals)
       - Train/test split (70/30)
-      - RandomizedSearchCV over key hyperparameters with 5-fold CV
+      - RandomizedSearchCV over key hyperparameters, scoring average_precision (PR-AUC)
       - Evaluate metrics and plot ROC + Precision-Recall
+      - Tune threshold for best F1 and for minimum expected cost (cost_fp, cost_fn)
       - Save best model to models/xgb_default_model.pkl
 
     Returns
     -------
     model: XGBClassifier (best estimator)
-    metrics: dict with accuracy, auc_roc, f1, confusion_matrix, best_params
+    metrics: dict with accuracy, auc_roc, F1/cost threshold results, confusion matrices, best_params
     """
     # 1) Load data
     df = pd.read_csv(data_path)
@@ -251,7 +253,7 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
         subsample=0.9,
         colsample_bytree=0.9,
         objective="binary:logistic",
-        eval_metric="logloss",
+        eval_metric="aucpr",
         tree_method="hist",
         random_state=42,
         n_jobs=os.cpu_count() or 4,
@@ -268,6 +270,14 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
         X, y, test_size=0.30, random_state=42, stratify=y
     )
 
+    # Handle class imbalance: scale_pos_weight
+    pos = int((y_train == 1).sum())
+    neg = int((y_train == 0).sum())
+    if pos == 0:
+        raise ValueError("No positive examples in training set after filtering.")
+    base_spw = max(neg / pos, 1.0)
+    print(f"Class imbalance: pos={pos}, neg={neg}, scale_pos_weight base={base_spw:.2f}")
+
     # 3b) Hyperparameter search space (RandomizedSearchCV)
     param_distributions = {
         "model__n_estimators": randint(200, 800),
@@ -275,15 +285,16 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
         "model__learning_rate": uniform(0.01, 0.29),
         "model__subsample": uniform(0.6, 0.4),
         "model__colsample_bytree": uniform(0.6, 0.4),
+        "model__scale_pos_weight": [base_spw * f for f in (0.5, 1.0, 2.0, 4.0, 8.0, 12.0)],
     }
 
-    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     search = RandomizedSearchCV(
         estimator=pipe,
         param_distributions=param_distributions,
-        n_iter=5,
-        scoring="roc_auc",
+        n_iter=10,
+        scoring="average_precision",
         n_jobs=os.cpu_count() or 4,
         cv=cv,
         verbose=1,
@@ -295,22 +306,91 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
 
     best_model: Pipeline = search.best_estimator_
 
-    # 4) Evaluation
+    # 4) Evaluation at default threshold 0.5
     y_pred = best_model.predict(X_test)
-    # For ROC/PR we need probabilities
     y_proba = best_model.predict_proba(X_test)[:, 1]
 
     acc = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
-    f1 = f1_score(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred)
+    f1_default = f1_score(y_test, y_pred)
+    cm_default = confusion_matrix(y_test, y_pred)
+
+    # Threshold tuning using precision-recall curve (for plotting)
+    precisions, recalls, thresholds = precision_recall_curve(y_test, y_proba)
+
+    # Build a thresholds scan for F1 and cost (include extremes)
+    thresholds_scan = np.unique(np.concatenate(([0.0], thresholds, [1.0])))
+    f1_per_thr = []
+    prec_per_thr = []
+    rec_per_thr = []
+    cost_per_thr = []
+    cms_per_thr = []
+    for thr in thresholds_scan:
+        yp = (y_proba >= thr).astype(int)
+        cm = confusion_matrix(y_test, yp)
+        tn, fp, fn, tp = cm.ravel()
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1_val = 2 * p * r / (p + r + 1e-12) if (p + r) > 0 else 0.0
+        cost_val = cost_fp * fp + cost_fn * fn
+        f1_per_thr.append(f1_val)
+        prec_per_thr.append(p)
+        rec_per_thr.append(r)
+        cost_per_thr.append(cost_val)
+        cms_per_thr.append(cm)
+
+    f1_per_thr = np.array(f1_per_thr)
+    prec_per_thr = np.array(prec_per_thr)
+    rec_per_thr = np.array(rec_per_thr)
+    cost_per_thr = np.array(cost_per_thr)
+
+    # Best F1 threshold
+    idx_f1 = int(np.argmax(f1_per_thr))
+    best_threshold_f1 = float(thresholds_scan[idx_f1])
+    best_f1 = float(f1_per_thr[idx_f1])
+    best_precision_f1 = float(prec_per_thr[idx_f1])
+    best_recall_f1 = float(rec_per_thr[idx_f1])
+    cm_f1 = cms_per_thr[idx_f1].tolist()
+
+    # Best cost threshold with optional recall constraint
+    if min_recall is not None:
+        valid = rec_per_thr >= float(min_recall)
+        if valid.any():
+            idx_cost = int(np.argmin(cost_per_thr[valid]))
+            idx_cost = int(np.arange(len(thresholds_scan))[valid][idx_cost])
+        else:
+            idx_cost = int(np.argmin(cost_per_thr))
+    else:
+        idx_cost = int(np.argmin(cost_per_thr))
+
+    best_threshold_cost = float(thresholds_scan[idx_cost])
+    best_cost = float(cost_per_thr[idx_cost])
+    best_precision_cost = float(prec_per_thr[idx_cost])
+    best_recall_cost = float(rec_per_thr[idx_cost])
+    cm_cost = cms_per_thr[idx_cost].tolist()
 
     metrics = {
         "accuracy": float(acc),
         "auc_roc": float(auc),
-        "f1_score": float(f1),
-        "confusion_matrix": cm.tolist(),
+        "f1_score_default": float(f1_default),
+        "confusion_matrix_default": cm_default.tolist(),
         "best_params": search.best_params_,
+        # F1-optimal threshold
+        "best_threshold_f1": best_threshold_f1,
+        "f1_score_opt": best_f1,
+        "precision_opt": best_precision_f1,
+        "recall_opt": best_recall_f1,
+        "confusion_matrix_opt": cm_f1,
+        # Cost-optimal threshold
+        "best_threshold_cost": best_threshold_cost,
+        "expected_cost_min": best_cost,
+        "precision_cost": best_precision_cost,
+        "recall_cost": best_recall_cost,
+        "confusion_matrix_cost": cm_cost,
+        # For reference
+        "cost_fp": float(cost_fp),
+        "cost_fn": float(cost_fn),
+        "min_recall": float(min_recall) if min_recall is not None else None,
     }
 
     # Plot ROC and PR curves
@@ -319,7 +399,32 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
     axes[0].set_title("ROC Curve")
     PrecisionRecallDisplay.from_predictions(y_test, y_proba, ax=axes[1])
     axes[1].set_title("Precision-Recall Curve")
+    # Mark optimal points on PR curve (F1 and Cost)
+    axes[1].scatter([best_recall_f1], [best_precision_f1], color="red", label=f"Best F1={best_f1:.3f}")
+    axes[1].scatter([best_recall_cost], [best_precision_cost], color="green", label=f"Min cost @thr={best_threshold_cost:.2f}")
+    axes[1].legend()
     fig.tight_layout()
+    plt.show()
+
+    # Plot F1 vs threshold and Cost vs threshold
+    fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4))
+    axes2[0].plot(thresholds_scan, f1_per_thr, label="F1 vs threshold")
+    axes2[0].axvline(best_threshold_f1, color="red", linestyle="--", label=f"Best F1 thr={best_threshold_f1:.3f}")
+    axes2[0].set_xlabel("Threshold")
+    axes2[0].set_ylabel("F1 score")
+    axes2[0].legend()
+
+    axes2[1].plot(thresholds_scan, cost_per_thr, label=f"Cost (FP={cost_fp:.1f}, FN={cost_fn:.1f})")
+    axes2[1].axvline(best_threshold_cost, color="green", linestyle="--", label=f"Min cost thr={best_threshold_cost:.3f}")
+    if min_recall is not None:
+        # Show the recall constraint region
+        axes2[1].set_title(f"Cost vs threshold (min recall {min_recall:.2f})")
+    else:
+        axes2[1].set_title("Cost vs threshold")
+    axes2[1].set_xlabel("Threshold")
+    axes2[1].set_ylabel("Expected Cost")
+    axes2[1].legend()
+    fig2.tight_layout()
     plt.show()
 
     # 5) Save model
@@ -329,6 +434,10 @@ def train_xgboost_model(data_path: str) -> Tuple[XGBClassifier, Dict[str, Any]]:
     dump(best_model, model_path)
 
     print(f"Model saved to: {model_path}")
+    print(
+        f"Best F1 thr={best_threshold_f1:.4f} | F1={best_f1:.3f}, P={best_precision_f1:.3f}, R={best_recall_f1:.3f}\n"
+        f"Min cost thr={best_threshold_cost:.4f} | cost={best_cost:.1f}, P={best_precision_cost:.3f}, R={best_recall_cost:.3f}"
+    )
 
     return best_model, metrics
 
@@ -339,7 +448,8 @@ data_path = "../data/dataproject2025.csv"
 
 # %% Train and evaluate
 if os.path.exists(data_path):
-    model, eval_metrics = train_xgboost_model(data_path)
+    # Set costs here if needed, e.g., cost_fn >> cost_fp
+    model, eval_metrics = train_xgboost_model(data_path, cost_fp=1.0, cost_fn=5.0, min_recall=None)
 else:
     print(f"CSV not found at: {data_path}. Please set 'data_path' to the correct location.")
 
