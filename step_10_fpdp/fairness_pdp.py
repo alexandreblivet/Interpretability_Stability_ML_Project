@@ -1,64 +1,54 @@
 #!/usr/bin/env python3
 """
-Fairness Partial Dependence Plot (FPDP) Implementation
-Analyzes XGBoost model predictions across different demographic groups
-Uses same approach as step_9_fairness with Pct_afro_american quartiles
-Works directly with existing XGBoost predictions (no surrogate models)
+Simplified Fairness Partial Dependence Plot (FPDP) Implementation
+Directly uses the xgboost_black_box_pipeline_vf.pkl model for predictions
+Uses the same preprocessing pipeline from steps_2_&_3_vf.py
+Analyzes predictions across different demographic groups
+No surrogate models - analyzes the actual XGBoost pipeline results
 """
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import pickle
-from sklearn.preprocessing import LabelEncoder
+from joblib import load
 import warnings
 warnings.filterwarnings('ignore')
 
-def load_xgboost_model_info():
-    """Load XGBoost model info from pkl file"""
+def load_xgboost_pipeline():
+    """Load XGBoost pipeline from vf pkl file"""
     try:
-        with open('../models/xgboost_black_box_model.pkl', 'rb') as f:
-            model = pickle.load(f)
-        print(f"XGBoost model info: {type(model)}")
-        print(f"Model expects {model.n_features_in_} features (after vectorization)")
-        return model
+        pipeline = load('../models/xgboost_black_box_pipeline_vf.pkl')
+        print(f"XGBoost pipeline loaded: {type(pipeline)}")
+        print(f"Pipeline has steps: {[step[0] for step in pipeline.steps]}")
+        return pipeline
     except Exception as e:
-        print(f"Model info: {e}")
+        print(f"Pipeline loading error: {e}")
         return None
 
 def load_data():
-    """Load data with existing XGBoost predictions"""
-    print("Loading data with existing XGBoost predictions...")
+    """Load raw data for pipeline processing using same format as steps_2_&_3_vf.py"""
+    print("Loading raw data for XGBoost pipeline...")
 
     df = pd.read_csv('../data/dataproject2025 (5).csv', index_col=0)
 
-    # Use a sample for faster processing
-    sample_size = min(15000, len(df))
+    # Use a smaller sample for faster processing in fairness analysis
+    sample_size = min(5000, len(df))
     df = df.sample(n=sample_size, random_state=42)
     print(f"Using sample of {sample_size} rows")
 
-    # Store original data before preprocessing for group definition
+    # Store original data for group definition (before any preprocessing)
     df_original = df.copy()
 
-    # Basic preprocessing for features
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-
-    # Get features (exclude target and prediction columns)
-    exclude_cols = ['target', 'Predictions', 'Predicted probabilities']
+    # Get features using same format as original training (steps_2_&_3_vf.py)
+    exclude_cols = ['Unnamed: 0', 'Predictions', 'Predicted probabilities', 'target']
     feature_cols = [col for col in df.columns if col not in exclude_cols]
-    X = df[feature_cols]
+    X = df[feature_cols].copy()
 
-    # Use existing XGBoost predictions
-    xgb_predictions = df['Predicted probabilities']
+    print(f"Raw features: {len(feature_cols)}")
+    print(f"Sample data shape: {X.shape}")
 
-    print(f"Features: {len(feature_cols)}")
-    print(f"XGBoost predictions range: {xgb_predictions.min():.4f} to {xgb_predictions.max():.4f}")
-
-    return X, xgb_predictions, feature_cols, df_original
+    return X, feature_cols, df_original
 
 def define_demographic_groups(df_original):
     """Define demographic groups using same approach as step_9_fairness"""
@@ -94,34 +84,57 @@ def define_demographic_groups(df_original):
 
     return groups
 
-def get_top_features_by_correlation(X, xgb_predictions, feature_cols, n_features=4):
-    """Get top features by correlation with XGBoost predictions"""
-    print(f"Finding top {n_features} features by correlation with XGBoost predictions...")
+def get_top_features_by_importance(pipeline, X, feature_cols, n_features=4):
+    """Get top features using the pipeline predictions"""
+    print(f"Getting predictions from XGBoost pipeline to find top {n_features} features...")
 
+    # Get predictions from the pipeline
+    try:
+        pipeline_predictions = pipeline.predict_proba(X)[:, 1]  # Get positive class probabilities
+        print(f"Pipeline predictions range: {pipeline_predictions.min():.4f} to {pipeline_predictions.max():.4f}")
+    except Exception as e:
+        print(f"Error getting pipeline predictions: {e}")
+        # Fallback to first few features
+        return feature_cols[:n_features]
+
+    # Find features with highest correlation to pipeline predictions
     correlations = []
     for col in feature_cols:
-        corr = abs(X[col].corr(xgb_predictions))
-        if not np.isnan(corr):
-            correlations.append((col, corr))
+        if col in X.columns:
+            # For numerical columns, use directly
+            if X[col].dtype in ['int64', 'int32', 'float64', 'float32']:
+                x_values = X[col].fillna(0)  # Fill NaN with 0
+            else:
+                # For categorical, encode as numerical for correlation
+                x_values = pd.Categorical(X[col]).codes
+
+            try:
+                corr = abs(np.corrcoef(x_values, pipeline_predictions)[0, 1])
+                if not np.isnan(corr):
+                    correlations.append((col, corr))
+            except:
+                continue
 
     correlations.sort(key=lambda x: x[1], reverse=True)
     top_features = [feat for feat, _ in correlations[:n_features]]
 
-    print(f"Top {n_features} features by correlation with XGBoost predictions:")
+    print(f"Top {n_features} features by correlation with pipeline predictions:")
     for i, (feat, corr) in enumerate(correlations[:n_features], 1):
         print(f"{i:2}. {feat:25} {corr:.4f}")
 
     return top_features
 
-def calculate_group_pdp_manual(X, xgb_predictions, feature, groups, grid_resolution=20):
-    """Calculate PDP for different demographic groups using XGBoost predictions"""
+def calculate_group_pdp_with_pipeline(pipeline, X, feature, groups, grid_resolution=10):
+    """Calculate PDP for different demographic groups using XGBoost pipeline"""
     group_values = sorted(groups.unique())
     group_pdps = {}
 
-    # Create value grid
-    feature_values = X[feature].values
-    if X[feature].nunique() <= 10:  # Discrete
-        grid = np.unique(feature_values)
+    # Create value grid based on feature type
+    feature_values = X[feature].dropna()
+    if feature_values.nunique() <= 8 or X[feature].dtype == 'object':  # Categorical/discrete
+        grid = sorted(feature_values.unique())
+        if len(grid) > 12:  # Limit categorical values
+            grid = grid[:12]
     else:
         grid = np.linspace(feature_values.min(), feature_values.max(), grid_resolution)
 
@@ -129,7 +142,6 @@ def calculate_group_pdp_manual(X, xgb_predictions, feature, groups, grid_resolut
         # Filter data for this group
         group_mask = groups == group
         X_group = X[group_mask]
-        pred_group = xgb_predictions[group_mask]
 
         if len(X_group) < 30:  # Skip small groups
             print(f"  Skipping group {group} (only {len(X_group)} samples)")
@@ -137,34 +149,33 @@ def calculate_group_pdp_manual(X, xgb_predictions, feature, groups, grid_resolut
 
         print(f"  Processing group {group} ({len(X_group)} samples)")
 
-        # Calculate PDP for this group using XGBoost predictions
+        # Calculate PDP for this group using pipeline
         pdp_values = []
         for grid_value in grid:
-            if X[feature].nunique() <= 10:  # Discrete
-                mask = X_group[feature] == grid_value
-            else:  # Continuous
-                range_size = (feature_values.max() - feature_values.min()) / (grid_resolution * 2)
-                mask = np.abs(X_group[feature] - grid_value) <= range_size
+            try:
+                # Create modified dataset with feature fixed to grid_value
+                X_modified = X_group.copy()
+                X_modified[feature] = grid_value
 
-            if mask.sum() > 0:
-                # Average XGBoost predictions for this feature value in this group
-                avg_prediction = pred_group[mask].mean()
+                # Get predictions from pipeline
+                predictions = pipeline.predict_proba(X_modified)[:, 1]
+                avg_prediction = predictions.mean()
                 pdp_values.append(avg_prediction)
-            else:
+            except Exception as e:
+                print(f"    Error at grid value {grid_value}: {e}")
                 pdp_values.append(np.nan)
 
         # Remove NaN values
         valid_mask = ~np.isnan(pdp_values)
         if valid_mask.sum() > 0:
             group_pdps[group] = np.array(pdp_values)[valid_mask]
-            grid = grid[valid_mask]
 
     return grid, group_pdps
 
-def create_fairness_pdp_plots(X, xgb_predictions, features, groups):
+def create_fairness_pdp_plots(pipeline, X, features, groups):
     """Create fairness PDP plots comparing different demographic groups"""
     print(f"Creating Fairness PDP plots for {len(features)} features...")
-    print(f"Comparing across {groups.name} groups using XGBoost predictions")
+    print(f"Comparing across {groups.name} groups using XGBoost pipeline")
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     axes = axes.flatten()
@@ -177,8 +188,8 @@ def create_fairness_pdp_plots(X, xgb_predictions, features, groups):
         ax = axes[i]
 
         print(f"Calculating FPDP for {feature}...")
-        # Calculate fairness PDP using XGBoost predictions
-        grid, group_pdps = calculate_group_pdp_manual(X, xgb_predictions, feature, groups)
+        # Calculate fairness PDP using XGBoost pipeline
+        grid, group_pdps = calculate_group_pdp_with_pipeline(pipeline, X, feature, groups)
 
         # Plot PDP for each group
         for j, (group, pdp_values) in enumerate(group_pdps.items()):
@@ -186,26 +197,26 @@ def create_fairness_pdp_plots(X, xgb_predictions, features, groups):
                    label=f'{group}', marker='o', markersize=4, alpha=0.8)
 
         ax.set_xlabel(feature, fontsize=11, fontweight='bold')
-        ax.set_ylabel('Partial Dependence\n(XGBoost Prediction)', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Partial Dependence\n(Pipeline Prediction)', fontsize=11, fontweight='bold')
         ax.set_title(f'Fairness PDP: {feature}', fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, title=groups.name)
 
-    plt.suptitle(f'Fairness Partial Dependence Plots\nSensitive Attribute: {groups.name}\n(Direct from XGBoost Predictions)',
+    plt.suptitle(f'Fairness Partial Dependence Plots\nSensitive Attribute: {groups.name}\n(xgboost_black_box_pipeline_vf.pkl)',
                 fontsize=16, fontweight='bold', y=0.95)
     plt.tight_layout()
     plt.savefig('fairness_pdp_plots.png', dpi=300, bbox_inches='tight')
     print("Fairness PDP plots saved as 'fairness_pdp_plots.png'")
     plt.show()
 
-def calculate_fairness_metrics(X, xgb_predictions, features, groups):
+def calculate_fairness_metrics(pipeline, X, features, groups):
     """Calculate fairness metrics based on PDP differences"""
     print(f"\nCalculating fairness metrics for {groups.name}...")
 
     fairness_results = {}
 
     for feature in features:
-        grid, group_pdps = calculate_group_pdp_manual(X, xgb_predictions, feature, groups)
+        grid, group_pdps = calculate_group_pdp_with_pipeline(pipeline, X, feature, groups)
 
         if len(group_pdps) < 2:
             continue
@@ -235,7 +246,7 @@ def calculate_fairness_metrics(X, xgb_predictions, features, groups):
         bars = plt.barh(features_list, max_diffs, color='#e74c3c', alpha=0.7, edgecolor='black')
         plt.xlabel('Maximum Group Difference', fontsize=12, fontweight='bold')
         plt.ylabel('Features', fontsize=12, fontweight='bold')
-        plt.title(f'Fairness Analysis: Maximum PDP Differences\nSensitive Attribute: {groups.name}\n(XGBoost Black Box Model)',
+        plt.title(f'Fairness Analysis: Maximum PDP Differences\nSensitive Attribute: {groups.name}\n(xgboost_black_box_pipeline_vf.pkl)',
                   fontsize=14, fontweight='bold')
         plt.grid(True, alpha=0.3, axis='x')
 
@@ -264,36 +275,39 @@ def calculate_fairness_metrics(X, xgb_predictions, features, groups):
 
 def main():
     """Main function"""
-    print("Starting XGBoost Fairness PDP Analysis...")
+    print("Starting Simplified XGBoost Fairness PDP Analysis...")
+    print("Using xgboost_black_box_pipeline_vf.pkl directly (no surrogate models)")
     print("Using same demographic groups as step_9_fairness")
-    print("Working directly with XGBoost predictions (no surrogate models)")
     print("="*60)
 
     try:
-        # Load XGBoost model info
-        xgb_model = load_xgboost_model_info()
+        # Load XGBoost pipeline
+        pipeline = load_xgboost_pipeline()
+        if pipeline is None:
+            print("Failed to load pipeline. Exiting.")
+            return 1
 
-        # Load data with existing XGBoost predictions
-        X, xgb_predictions, feature_cols, df_original = load_data()
+        # Load raw data
+        X, feature_cols, df_original = load_data()
 
         # Define demographic groups (same as step_9_fairness)
         groups = define_demographic_groups(df_original)
 
-        # Get top features by correlation with XGBoost predictions
-        top_features = get_top_features_by_correlation(X, xgb_predictions, feature_cols, n_features=4)
+        # Get top features using pipeline predictions
+        top_features = get_top_features_by_importance(pipeline, X, feature_cols, n_features=4)
 
-        # Create fairness PDP plots using XGBoost predictions directly
-        create_fairness_pdp_plots(X, xgb_predictions, top_features, groups)
+        # Create fairness PDP plots using pipeline directly
+        create_fairness_pdp_plots(pipeline, X, top_features, groups)
 
         # Calculate fairness metrics
-        fairness_results = calculate_fairness_metrics(X, xgb_predictions, top_features, groups)
+        fairness_results = calculate_fairness_metrics(pipeline, X, top_features, groups)
 
         print("\n" + "="*60)
-        print("FAIRNESS PDP ANALYSIS COMPLETED SUCCESSFULLY!")
+        print("SIMPLIFIED FAIRNESS PDP ANALYSIS COMPLETED SUCCESSFULLY!")
         print("="*60)
-        print("This analysis shows how the XGBoost model's predictions vary")
+        print("This analysis shows how the XGBoost pipeline's predictions vary")
         print("across different demographic groups, calculated directly from")
-        print("the model's actual predictions (no surrogate approximation).")
+        print("the xgboost_black_box_pipeline_vf.pkl model without surrogate models.")
         print(f"Analyzed groups: {groups.name}")
         print("Generated files:")
         print("- fairness_pdp_plots.png")
