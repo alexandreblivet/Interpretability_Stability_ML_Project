@@ -21,7 +21,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, a
 warnings.filterwarnings('ignore')
 
 # %%
-df = pd.read_csv('../data/dataproject2025.csv')
+df = pd.read_csv('data/dataproject2025.csv')
 
 # %%
 # Prepare data using TableVectorizer for automated preprocessing
@@ -277,9 +277,9 @@ final_pipeline = Pipeline([
 ])
 
 # Save the full pipeline as a .pkl file
-dump(final_pipeline, '../models/xgboost_black_box_pipeline_vf.pkl')
+dump(final_pipeline, '/models/xgboost_black_box_pipeline_vf.pkl')
 
-print("Full pipeline (vectorizer + XGBoost) saved as '../models/xgboost_black_box_pipeline_vf.pkl'")
+print("Full pipeline (vectorizer + XGBoost) saved as '/models/xgboost_black_box_pipeline_vf.pkl'")
 
 
 
